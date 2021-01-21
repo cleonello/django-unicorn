@@ -2,6 +2,7 @@ import logging
 from functools import wraps
 from typing import Any, Dict, List, Union
 
+from django.core.cache import cache
 from django.db.models import Model
 from django.http import HttpRequest, JsonResponse
 from django.views.decorators.csrf import csrf_protect
@@ -185,31 +186,7 @@ def _call_method_name(
             return func()
 
 
-@timed
-@handle_error
-@csrf_protect
-@require_POST
-def message(request: HttpRequest, component_name: str = None) -> JsonResponse:
-    """
-    Endpoint that instantiates the component and does the correct action
-    (set an attribute or call a method) depending on the JSON payload in the body.
-
-    Args:
-        param request: HttpRequest for the function-based view.
-        param: component_name: Name of the component, e.g. "hello-world".
-    
-    Returns:
-        JSON with the following structure:
-        {
-            "id": component_id,
-            "dom": html,  // re-rendered version of the component after actions in the payload are completed
-            "data": {},  // updated data after actions in the payload are completed
-        }
-    """
-
-    assert component_name, "Missing component name in url"
-
-    component_request = ComponentRequest(request)
+def _process_message(request, component_name, component_request):
     component = UnicornView.create(
         component_id=component_request.id,
         component_name=component_name,
@@ -420,5 +397,58 @@ def message(request: HttpRequest, component_name: str = None) -> JsonResponse:
                 }
             }
         )
+
+    return res
+
+
+@timed
+@handle_error
+@csrf_protect
+@require_POST
+def message(request: HttpRequest, component_name: str = None) -> JsonResponse:
+    """
+    Endpoint that instantiates the component and does the correct action
+    (set an attribute or call a method) depending on the JSON payload in the body.
+
+    Args:
+        param request: HttpRequest for the function-based view.
+        param: component_name: Name of the component, e.g. "hello-world".
+    
+    Returns:
+        JSON with the following structure:
+        {
+            "id": component_id,
+            "dom": html,  // re-rendered version of the component after actions in the payload are completed
+            "data": {},  // updated data after actions in the payload are completed
+        }
+    """
+
+    assert component_name, "Missing component name in url"
+
+    component_request = ComponentRequest(request)
+
+    # Add the current request `ComponentRequest` to the cache
+    component_cache_key = f"{component_name}:{component_request.id}"
+    component_requests = cache.get(component_cache_key) or []
+    component_requests.append(component_request)
+    cache.set(component_cache_key, component_requests)
+
+    # Handle current request and any others in the cache
+    res = {}
+
+    while component_requests:
+        component_request = component_requests[0]
+
+        if res:
+            print("merge res.data into component_request.data somehow")
+
+        # Can't store request on a `ComponentRequest` and cache it because `HttpRequest`
+        # isn't pickleable. Does it matter that a different request gets passed in then
+        # the original request that generated the `ComponentRequest`?
+        res = _process_message(request, component_name, component_request)
+
+        component_requests.pop()
+        cache.set(component_cache_key, component_requests)
+        component_requests = cache.get(component_cache_key) or []
 
     return JsonResponse(res)
