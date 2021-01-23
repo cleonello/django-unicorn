@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 
+UNICORN_REQUEST_TIMEOUT = 60 * 1
+
+
 def handle_error(view_func):
     def wrapped_view(*args, **kwargs):
         try:
@@ -186,7 +189,36 @@ def _call_method_name(
             return func()
 
 
-def _process_message(request, component_name, component_request):
+def _process_component_request(
+    request: HttpRequest, component_name: str, component_request: ComponentRequest
+) -> Dict:
+    """
+    Process a `ComponentRequest` by:
+        1. construct a Component view
+        2. set all of the properties on the view from the data
+        3. execute the type
+            - update the properties based on the payload for "syncInput"
+            - create/update the Django Model based on the payload for "dbInput"
+            - call the method specified for "callMethod"
+        4. validate any fields specified in a Django form
+        5. construct a `dict` that will get returned in a `JsonResponse` later on
+    
+    Args:
+        param request: HttpRequest for the function-based view.
+        param: component_name: Name of the component, e.g. "hello-world".
+        param: component_request: Component request to process.
+    
+    Returns:
+        `dict` with the following structure:
+        {
+            "id": component_id,
+            "dom": html,  // re-rendered version of the component after actions in the payload are completed
+            "data": {},  // updated data after actions in the payload are completed
+            "errors": {},  // form validation errors
+            "return": {}, // optional return value from an executed action
+            "parent": {},  // optional representation of the parent component
+        }
+    """
     component = UnicornView.create(
         component_id=component_request.id,
         component_name=component_name,
@@ -401,6 +433,137 @@ def _process_message(request, component_name, component_request):
     return res
 
 
+def _handle_component_request(
+    request: HttpRequest, component_name: str, component_request: ComponentRequest
+) -> Dict:
+    """
+    Process a `ComponentRequest` by adding it to the cache and then either:
+        - processing all of the component requests in the cache and returning the resulting value if
+            it is the first component request for that particular component name + component id combination
+        - return a `dict` saying that the request has been queued
+    
+    Args:
+        param request: HttpRequest for the function-based view.
+        param: component_name: Name of the component, e.g. "hello-world".
+        param: component_request: Component request to process.
+    
+    Returns:
+        `dict` with the following structure:
+        {
+            "id": component_id,
+            "dom": html,  // re-rendered version of the component after actions in the payload are completed
+            "data": {},  // updated data after actions in the payload are completed
+            "errors": {},  // form validation errors
+            "return": {}, // optional return value from an executed action
+            "parent": {},  // optional representation of the parent component
+        }
+    """
+    # Add the current request `ComponentRequest` to the cache
+    # TODO: Add component name to `ComponentRequest` (grab it off of the request path?)
+    component_cache_key = f"{component_name}:{component_request.id}"
+    component_requests = cache.get(component_cache_key) or []
+    component_requests.append(component_request)
+    cache.set(component_cache_key, component_requests, timeout=UNICORN_REQUEST_TIMEOUT)
+
+    if len(component_requests) > 1:
+        original_epoch = component_requests[0].epoch
+        return {
+            "queued": True,
+            "epoch": component_request.epoch,
+            "original_epoch": original_epoch,
+        }
+
+    return _handle_component_requests(request, component_name, component_cache_key)
+
+
+def _handle_component_requests(
+    request: HttpRequest, component_name: str, component_cache_key
+) -> Dict:
+    """
+    Process the current component requests that are stored in cache.
+    Also recursively checks for new requests that might have happened
+    while executing the first request, merges them together and returns
+    the correct appropriate data.
+
+    Args:
+        param request: HttpRequest for the view.
+        param: component_name: Name of the component, e.g. "hello-world".
+        param: component_cache_key: Cache key created from name of the component and the
+            component id which should be unique for any particular user's request lifecycle.
+    
+    Returns:
+        JSON with the following structure:
+        {
+            "id": component_id,
+            "dom": html,  // re-rendered version of the component after actions in the payload are completed
+            "data": {},  // updated data after actions in the payload are completed
+            "errors": {},  // form validation errors
+            "return": {}, // optional return value from an executed action
+            "parent": {},  // optional representation of the parent component
+        }
+    """
+    # Handle current request and any others in the cache
+    # sort all of the current requests by ascending order
+    component_requests = cache.get(component_cache_key)
+    component_requests = sorted(component_requests, key=lambda cr: cr.epoch)
+
+    # get first request we know about
+    first_component_request = component_requests[0]
+
+    # Can't store request on a `ComponentRequest` and cache it because `HttpRequest`
+    # isn't pickleable. Does it matter that a different request gets passed in then
+    # the original request that generated the `ComponentRequest`?
+    json_result = _process_component_request(
+        request, component_name, first_component_request
+    )
+
+    component_requests = cache.get(component_cache_key)
+    component_requests.pop(0)
+    cache.set(component_cache_key, component_requests, timeout=UNICORN_REQUEST_TIMEOUT)
+
+    component_requests = cache.get(component_cache_key)
+
+    if component_requests:
+        merged_component_request = None
+
+        for additional_component_request in component_requests.copy():
+            if merged_component_request:
+                merged_component_request.action_queue.extend(
+                    additional_component_request.action_queue
+                )
+
+                if first_component_request.data != additional_component_request.data:
+                    # print("merge res.data into component_request.data somehow")
+                    pass
+            else:
+                merged_component_request = additional_component_request
+
+            component_requests.pop(0)
+            cache.set(
+                component_cache_key,
+                component_requests,
+                timeout=UNICORN_REQUEST_TIMEOUT,
+            )
+
+        # if json_result.get("data"):
+        #     for key, val in json_result.get("data").items():
+        #         merged_component_request.action_queue.insert(
+        #             0, {"type": "syncInput", "payload": {"name": key, "value": val}}
+        #         )
+
+        new_json_result = _handle_component_request(
+            request, component_name, merged_component_request
+        )
+
+        original_return = json_result.get("return", {})
+        new_return = new_json_result.get("return", {})
+        new_json_result["return"] = [original_return, new_return]
+
+        return new_json_result
+
+    return json_result
+
+
 @timed
 @handle_error
 @csrf_protect
@@ -415,40 +578,20 @@ def message(request: HttpRequest, component_name: str = None) -> JsonResponse:
         param: component_name: Name of the component, e.g. "hello-world".
     
     Returns:
-        JSON with the following structure:
+        `JsonRequest` with the following structure in the body:
         {
             "id": component_id,
             "dom": html,  // re-rendered version of the component after actions in the payload are completed
             "data": {},  // updated data after actions in the payload are completed
+            "errors": {},  // form validation errors
+            "return": {}, // optional return value from an executed action
+            "parent": {},  // optional representation of the parent component
         }
     """
 
     assert component_name, "Missing component name in url"
 
     component_request = ComponentRequest(request)
+    json_result = _handle_component_request(request, component_name, component_request)
 
-    # Add the current request `ComponentRequest` to the cache
-    component_cache_key = f"{component_name}:{component_request.id}"
-    component_requests = cache.get(component_cache_key) or []
-    component_requests.append(component_request)
-    cache.set(component_cache_key, component_requests)
-
-    # Handle current request and any others in the cache
-    res = {}
-
-    while component_requests:
-        component_request = component_requests[0]
-
-        if res:
-            print("merge res.data into component_request.data somehow")
-
-        # Can't store request on a `ComponentRequest` and cache it because `HttpRequest`
-        # isn't pickleable. Does it matter that a different request gets passed in then
-        # the original request that generated the `ComponentRequest`?
-        res = _process_message(request, component_name, component_request)
-
-        component_requests.pop()
-        cache.set(component_cache_key, component_requests)
-        component_requests = cache.get(component_cache_key) or []
-
-    return JsonResponse(res)
+    return JsonResponse(json_result)
