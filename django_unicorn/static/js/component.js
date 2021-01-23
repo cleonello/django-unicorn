@@ -244,8 +244,7 @@ export class Component {
   handlePollError(err) {
     if (err) {
       console.error(err);
-    }
-    if (this.poll.timer) {
+    } else if (this.poll.timer) {
       clearInterval(this.poll.timer);
     }
   }
