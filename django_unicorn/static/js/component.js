@@ -223,7 +223,7 @@ export class Component {
     };
     this.actionQueue.push(action);
 
-    this.queueMessage(-1, (triggeringElements, _, err) => {
+    this.queueMessage(0, (triggeringElements, _, err) => {
       if (err && isFunction(errCallback)) {
         errCallback(err);
       } else if (err) {
